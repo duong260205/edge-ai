@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <algorithm>
 #include "freertos/FreeRTOS.h"
@@ -13,14 +14,13 @@
 #include "camera_pins.h"
 #include "driver/gpio.h"
 #include "face_recognition.h"
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
-#include "esp_tls.h"
-#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-#include "esp_crt_bundle.h"
-#endif
 #include "led_strip.h"
 #include "driver/uart.h"
+#include "audio_capture.h"
+#include "voice_auth.h"
+#include "esp_heap_caps.h"
+#include "esp_task_wdt.h"
+
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -35,9 +35,9 @@ led_strip_handle_t led_strip;
 
 static const char *TAG = "camera_http_server";
 
-// WiFi credentials - CHANGE THESE (search config.url webhook as well and replace with your webhook)
-#define WIFI_SSID "T6-ISUT-MIH"
-#define WIFI_PASS "@isut@mih#"
+// WiFi credentials - CHANGE THESE
+#define WIFI_SSID "P404"
+#define WIFI_PASS "12344321"
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -50,15 +50,21 @@ char name[MAX_NAME_LENGTH] = "Unknown";
 static char last_sent_name[MAX_NAME_LENGTH] = "";
 static TickType_t last_recognition_time = 0;
 static SemaphoreHandle_t name_mutex = NULL;
+static bool voice_auth_ready = false;
 
-#define MAX_HTTP_RECV_BUFFER 512
-#define MAX_HTTP_OUTPUT_BUFFER 2048
+static void free_psram(void *ptr)
+{
+    if (ptr != nullptr) {
+        heap_caps_free(ptr);
+    }
+}
+
 #define RECOGNITION_INTERVAL_MS 2000  // Check for faces every 2 seconds
-#define RECOGNITION_COOLDOWN_MS 30000 // Wait 30 seconds before sending same name again
+#define RECOGNITION_COOLDOWN_MS 30000 // Wait 30 seconds before sending same name again to UART
+#define VOICE_AUTH_COOLDOWN_MS 15000
+#define MAX_ENROLL_UPLOAD_BYTES (512 * 1024)
 
 // Forward declarations
-void discord_task(void *param);
-bool sendDiscordMessage(const char* message);
 void face_recognition_task(void *param);
 
 // HTML page for face enrollment
@@ -300,9 +306,9 @@ esp_err_t init_camera(void)
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size = FRAMESIZE_VGA,    // 640x480
         .jpeg_quality = 15,
-        .fb_count = 1,
+        .fb_count = 2,
         .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+        .grab_mode = CAMERA_GRAB_LATEST,
     };
 
     // Initialize camera
@@ -337,6 +343,12 @@ static esp_err_t stream_handler(httpd_req_t *req)
     uint8_t *_jpg_buf = NULL;
     char part_buf[64];
 
+    // Buffer PSRAM reusable trong suot 1 phien stream
+    // Cap phat 1 lan (hoac mo rong neu can), giai phong khi session ket thuc
+    // Tranh malloc/free moi frame gay phan manh PSRAM
+    uint8_t *reuse_buf = NULL;
+    size_t reuse_buf_size = 0;
+
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
         return res;
@@ -345,25 +357,45 @@ static esp_err_t stream_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Stream started");
 
     while (true) {
-        // Try to acquire camera with short timeout to allow enrollment
-        if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            fb = esp_camera_fb_get();
-            xSemaphoreGive(camera_mutex);
-        } else {
-            // Camera busy, skip this frame
+        if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        
+
+        fb = esp_camera_fb_get();
         if (!fb) {
+            xSemaphoreGive(camera_mutex);
             ESP_LOGE(TAG, "Camera capture failed");
             res = ESP_FAIL;
             break;
         }
 
+        // Copy frame ra reusable buffer (mo rong neu can), roi release camera_mutex NGAY
         _jpg_buf_len = fb->len;
-        _jpg_buf = fb->buf;
+        if (_jpg_buf_len > reuse_buf_size) {
+            // Mo rong buffer an toan: cap phat moi truoc, giai phong cu sau
+            uint8_t *new_buf = (uint8_t*)heap_caps_malloc(_jpg_buf_len + 256, MALLOC_CAP_SPIRAM);
+            if (new_buf) {
+                if (reuse_buf) heap_caps_free(reuse_buf);
+                reuse_buf = new_buf;
+                reuse_buf_size = _jpg_buf_len + 256;
+            } else {
+                ESP_LOGW(TAG, "Cannot grow stream buffer (%zu > %zu)", _jpg_buf_len, reuse_buf_size);
+                // Giu lai buffer cu neu ko the mo rong — skip frame nay
+                esp_camera_fb_return(fb);
+                xSemaphoreGive(camera_mutex);
+                continue;
+            }
+        }
+        _jpg_buf = reuse_buf;
+        if (_jpg_buf) {
+            memcpy(_jpg_buf, fb->buf, _jpg_buf_len);
+        }
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        xSemaphoreGive(camera_mutex);
 
+        // Gui HTTP chi luc da khong giu camera_mutex
         if (res == ESP_OK) {
             size_t hlen = snprintf(part_buf, 64, _STREAM_PART, _jpg_buf_len);
             res = httpd_resp_send_chunk(req, part_buf, hlen);
@@ -375,16 +407,14 @@ static esp_err_t stream_handler(httpd_req_t *req)
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         }
 
-        esp_camera_fb_return(fb);
-        fb = NULL;
-        _jpg_buf = NULL;
-
         if (res != ESP_OK) {
             break;
         }
+        vTaskDelay(1);
     }
 
     ESP_LOGI(TAG, "Stream ended");
+    if (reuse_buf) heap_caps_free(reuse_buf);
     return res;
 }
 
@@ -414,9 +444,15 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         int remaining = req->content_len;
         
         ESP_LOGI(TAG, "POST request, content length: %d", remaining);
+
+        if (remaining <= 0 || remaining > MAX_ENROLL_UPLOAD_BYTES) {
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Upload too large\"}");
+            return ESP_OK;
+        }
         
         // Allocate buffer for the image
-        image_buf = (uint8_t*)heap_caps_malloc(remaining, MALLOC_CAP_SPIRAM);
+        image_buf = (uint8_t*)heap_caps_malloc((size_t)remaining, MALLOC_CAP_SPIRAM);
         if (!image_buf) {
             ESP_LOGE(TAG, "Failed to allocate image buffer");
             httpd_resp_set_type(req, "application/json");
@@ -426,17 +462,24 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         
         // Read the entire POST body
         size_t received = 0;
+        int recv_timeouts = 0;
         while (remaining > 0) {
             buf_len = MIN(remaining, sizeof(buf));
             int ret = httpd_req_recv(req, buf, buf_len);
             if (ret <= 0) {
                 if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                    if (++recv_timeouts > 20) {
+                        free_psram(image_buf);
+                        httpd_resp_send_500(req);
+                        return ESP_FAIL;
+                    }
                     continue;
                 }
-                free(image_buf);
+                free_psram(image_buf);
                 httpd_resp_send_500(req);
                 return ESP_FAIL;
             }
+            recv_timeouts = 0;
             memcpy(image_buf + received, buf, ret);
             received += ret;
             remaining -= ret;
@@ -460,7 +503,7 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         
         if (!jpeg_start) {
             ESP_LOGE(TAG, "Failed to find JPEG start marker");
-            free(image_buf);
+            free_psram(image_buf);
             httpd_resp_set_type(req, "application/json");
             httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"No JPEG data found\"}");
             return ESP_OK;
@@ -479,7 +522,7 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         
         if (!jpeg_end) {
             ESP_LOGE(TAG, "Failed to find JPEG end marker");
-            free(image_buf);
+            free_psram(image_buf);
             httpd_resp_set_type(req, "application/json");
             httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Invalid JPEG data\"}");
             return ESP_OK;
@@ -534,7 +577,7 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         
         if (strlen(name) == 0) {
             ESP_LOGE(TAG, "Name not extracted");
-            free(image_buf);
+            free_psram(image_buf);
             httpd_resp_set_type(req, "application/json");
             httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Name not found in form data\"}");
             return ESP_OK;
@@ -552,8 +595,7 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         // Enroll the face (keep image_buf alive during enrollment)
         int id = face_recognition_enroll(&fb, name);
         
-        // Now we can free the buffer
-        free(image_buf);
+        free_psram(image_buf);
         
         char json[128];
         if (id >= 0) {
@@ -575,7 +617,6 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         if (httpd_query_key_value(query, "name", name, sizeof(name)) == ESP_OK) {
             ESP_LOGI(TAG, "Enrolling face with name: %s", name);
             
-            // Acquire camera with timeout
             if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
                 ESP_LOGE(TAG, "Camera busy, timeout");
                 httpd_resp_set_type(req, "application/json");
@@ -583,11 +624,9 @@ static esp_err_t enroll_handler(httpd_req_t *req)
                 return ESP_OK;
             }
             
-            // Capture a frame
             camera_fb_t *fb = esp_camera_fb_get();
-            xSemaphoreGive(camera_mutex);
-            
             if (!fb) {
+                xSemaphoreGive(camera_mutex);
                 ESP_LOGE(TAG, "Camera capture failed");
                 httpd_resp_set_type(req, "application/json");
                 httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Camera capture failed\"}");
@@ -596,9 +635,9 @@ static esp_err_t enroll_handler(httpd_req_t *req)
             
             ESP_LOGI(TAG, "Frame captured, size: %d bytes", fb->len);
             
-            // Enroll the face
             int id = face_recognition_enroll(fb, name);
             esp_camera_fb_return(fb);
+            xSemaphoreGive(camera_mutex);
             
             char json[128];
             if (id >= 0) {
@@ -627,29 +666,28 @@ static esp_err_t faces_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Faces handler called");
     
-    char json[1024];
+    char json[2048];
     int count = face_recognition_get_enrolled_count();
+    int off = snprintf(json, sizeof(json), "{\"count\":%d,\"faces\":[", count);
+    bool first = true;
     
     ESP_LOGI(TAG, "Enrolled count: %d", count);
     
-    snprintf(json, sizeof(json), "{\"count\":%d,\"faces\":[", count);
-    
     for (int i = 0; i < MAX_FACE_ID_COUNT; i++) {
         face_id_t info;
-        if (face_recognition_get_info(i, &info) == ESP_OK && info.enrolled) {
-            char item[64];
-            snprintf(item, sizeof(item), "{\"id\":%d,\"name\":\"%s\"},", info.id, info.name);
-            strcat(json, item);
+        if (face_recognition_get_info(i, &info) != ESP_OK || !info.enrolled) {
+            continue;
         }
+        int n = snprintf(json + off, sizeof(json) - off,
+                         "%s{\"id\":%d,\"name\":\"%.31s\"}",
+                         first ? "" : ",", info.id, info.name);
+        if (n < 0 || (size_t)n >= sizeof(json) - off) {
+            break;
+        }
+        off += n;
+        first = false;
     }
-    
-    // Remove trailing comma if exists
-    int len = strlen(json);
-    if (json[len-1] == ',') {
-        json[len-1] = '\0';
-    }
-    
-    strcat(json, "]}");
+    snprintf(json + off, sizeof(json) - off, "]}");
     
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json);
@@ -684,7 +722,6 @@ static esp_err_t reset_database_handler(httpd_req_t *req)
         return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Failed to reset database\"}");
     }
 }
-
 // Ping test handler
 static esp_err_t ping_handler(httpd_req_t *req)
 {
@@ -701,7 +738,6 @@ static esp_err_t capture_handler(httpd_req_t *req)
     camera_fb_t *fb = NULL;
     esp_err_t res = ESP_OK;
     
-    // Acquire camera
     if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ESP_LOGE(TAG, "Camera busy");
         httpd_resp_send_500(req);
@@ -709,9 +745,8 @@ static esp_err_t capture_handler(httpd_req_t *req)
     }
     
     fb = esp_camera_fb_get();
-    xSemaphoreGive(camera_mutex);
-    
     if (!fb) {
+        xSemaphoreGive(camera_mutex);
         ESP_LOGE(TAG, "Camera capture failed");
         httpd_resp_send_500(req);
         return ESP_FAIL;
@@ -724,6 +759,7 @@ static esp_err_t capture_handler(httpd_req_t *req)
     
     res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
     esp_camera_fb_return(fb);
+    xSemaphoreGive(camera_mutex);
     
     return res;
 }
@@ -853,6 +889,10 @@ static esp_err_t recognition_stream_handler(httpd_req_t *req)
     char part_buf[128];
     char current_name[MAX_NAME_LENGTH];
 
+    // Buffer PSRAM reusable trong suot phien stream, tranh phan manh heap
+    uint8_t *reuse_buf = NULL;
+    size_t reuse_buf_size = 0;
+
     res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
     if (res != ESP_OK) {
         return res;
@@ -861,33 +901,54 @@ static esp_err_t recognition_stream_handler(httpd_req_t *req)
     ESP_LOGI(TAG, "Recognition stream started");
 
     while (true) {
-        // Try to acquire camera with short timeout
-        if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            fb = esp_camera_fb_get();
-            xSemaphoreGive(camera_mutex);
-        } else {
+        if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        
+
+        fb = esp_camera_fb_get();
         if (!fb) {
+            xSemaphoreGive(camera_mutex);
             ESP_LOGE(TAG, "Camera capture failed");
             res = ESP_FAIL;
             break;
         }
 
-        // Get current recognized name (with mutex protection)
+        // Doc ten nguoi duoc nhan dien (name_mutex doc lap voi camera_mutex)
         if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            strcpy(current_name, name);
+            strncpy(current_name, name, MAX_NAME_LENGTH - 1);
+            current_name[MAX_NAME_LENGTH - 1] = '\0';
             xSemaphoreGive(name_mutex);
         } else {
             strcpy(current_name, "Unknown");
         }
 
+        // Copy frame ra reusable buffer (mo rong neu can), release camera_mutex NGAY
         _jpg_buf_len = fb->len;
-        _jpg_buf = fb->buf;
+        if (_jpg_buf_len > reuse_buf_size) {
+            // Mo rong buffer an toan: cap phat moi truoc, giai phong cu sau
+            uint8_t *new_buf = (uint8_t*)heap_caps_malloc(_jpg_buf_len + 256, MALLOC_CAP_SPIRAM);
+            if (new_buf) {
+                if (reuse_buf) heap_caps_free(reuse_buf);
+                reuse_buf = new_buf;
+                reuse_buf_size = _jpg_buf_len + 256;
+            } else {
+                ESP_LOGW(TAG, "Cannot grow recognition stream buffer (%zu > %zu)", _jpg_buf_len, reuse_buf_size);
+                // Giu lai buffer cu neu ko the mo rong — skip frame nay
+                esp_camera_fb_return(fb);
+                xSemaphoreGive(camera_mutex);
+                continue;
+            }
+        }
+        _jpg_buf = reuse_buf;
+        if (_jpg_buf) {
+            memcpy(_jpg_buf, fb->buf, _jpg_buf_len);
+        }
+        esp_camera_fb_return(fb);
+        fb = NULL;
+        xSemaphoreGive(camera_mutex);
 
-        // Send frame with recognition info in header
+        // Gui HTTP chi khi da khong giu camera_mutex
         if (res == ESP_OK) {
             size_t hlen = snprintf(part_buf, sizeof(part_buf), 
                 "Content-Type: image/jpeg\r\n"
@@ -903,16 +964,14 @@ static esp_err_t recognition_stream_handler(httpd_req_t *req)
             res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
         }
 
-        esp_camera_fb_return(fb);
-        fb = NULL;
-        _jpg_buf = NULL;
-
         if (res != ESP_OK) {
             break;
         }
+        vTaskDelay(1);
     }
 
     ESP_LOGI(TAG, "Recognition stream ended");
+    if (reuse_buf) heap_caps_free(reuse_buf);
     return res;
 }
 
@@ -940,7 +999,7 @@ void start_camera_server(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.ctrl_port = 32768;
-    config.max_uri_handlers = 16;  // Increased from 8 to support all our endpoints
+    config.max_uri_handlers = 16;
 
     httpd_uri_t index_uri = {
         .uri = "/",
@@ -1054,7 +1113,6 @@ void start_camera_server(void)
         
         esp_err_t rec_stream_reg = httpd_register_uri_handler(stream_httpd, &recognition_stream_data_uri);
         ESP_LOGI(TAG, "Registered: /recognition_stream (result: %d)", rec_stream_reg);
-        
         esp_netif_ip_info_t ip_info;
         esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
         if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
@@ -1065,101 +1123,6 @@ void start_camera_server(void)
     } else {
         ESP_LOGE(TAG, "Failed to start stream server");
     }
-}
-
-esp_err_t _http_event_handler(esp_http_client_event_t *evt)
-{
-    static char *output_buffer;  // Buffer to store response of http request from event handler
-    static int output_len;       // Stores number of bytes read
-    switch(evt->event_id) {
-        case HTTP_EVENT_ERROR:
-            ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
-            break;
-        case HTTP_EVENT_ON_CONNECTED:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
-            break;
-        case HTTP_EVENT_HEADER_SENT:
-            ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
-            break;
-        case HTTP_EVENT_ON_HEADER:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-            break;
-        case HTTP_EVENT_ON_DATA:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-            // Clean the buffer in case of a new request
-            if (output_len == 0 && evt->user_data) {
-                // we are just starting to copy the output data into the use
-                memset(evt->user_data, 0, MAX_HTTP_OUTPUT_BUFFER);
-            }
-            /*
-             *  Check for chunked encoding is added as the URL for chunked encoding used in this example returns binary data.
-             *  However, event handler can also be used in case chunked encoding is used.
-             */
-            if (!esp_http_client_is_chunked_response(evt->client)) {
-                // If user_data buffer is configured, copy the response into the buffer
-                int copy_len = 0;
-                if (evt->user_data) {
-                    // The last byte in evt->user_data is kept for the NULL character in case of out-of-bound access.
-                    copy_len = MIN(evt->data_len, (MAX_HTTP_OUTPUT_BUFFER - output_len));
-                    if (copy_len) {
-                        memcpy((char *)evt->user_data + output_len, evt->data, copy_len);
-                    }
-                } else {
-                    int content_len = esp_http_client_get_content_length(evt->client);
-                    if (output_buffer == NULL) {
-                        // We initialize output_buffer with 0 because it is used by strlen() and similar functions therefore should be null terminated.
-                        output_buffer = (char *) calloc(content_len + 1, sizeof(char));
-                        output_len = 0;
-                        if (output_buffer == NULL) {
-                            ESP_LOGE(TAG, "Failed to allocate memory for output buffer");
-                            return ESP_FAIL;
-                        }
-                    }
-                    copy_len = MIN(evt->data_len, (content_len - output_len));
-                    if (copy_len) {
-                        memcpy(output_buffer + output_len, evt->data, copy_len);
-                    }
-                }
-                output_len += copy_len;
-            }
-
-            break;
-        case HTTP_EVENT_ON_FINISH:
-            ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
-            if (output_buffer != NULL) {
-#if CONFIG_EXAMPLE_ENABLE_RESPONSE_BUFFER_DUMP
-                ESP_LOG_BUFFER_HEX(TAG, output_buffer, output_len);
-#endif
-                free(output_buffer);
-                output_buffer = NULL;
-            }
-            output_len = 0;
-            break;
-        case HTTP_EVENT_DISCONNECTED:
-            {
-                ESP_LOGI(TAG, "HTTP_EVENT_DISCONNECTED");
-                int mbedtls_err = 0;
-                esp_err_t err = esp_tls_get_and_clear_last_error((esp_tls_error_handle_t)evt->data, &mbedtls_err, NULL);
-                if (err != 0) {
-                    ESP_LOGI(TAG, "Last esp error code: 0x%x", err);
-                    ESP_LOGI(TAG, "Last mbedtls failure: 0x%x", mbedtls_err);
-                }
-                if (output_buffer != NULL) {
-                    free(output_buffer);
-                    output_buffer = NULL;
-                }
-                output_len = 0;
-            }
-            break;
-        case HTTP_EVENT_REDIRECT:
-            ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-            // For Discord webhook, follow redirects automatically
-            esp_http_client_set_redirection(evt->client);
-            break;
-        default:
-            break;
-    }
-    return ESP_OK;
 }
 
 void init_neopixel(void)
@@ -1209,61 +1172,6 @@ void set_neopixel_color(int r, int g, int b)
     }
 }
 
-// Task to send Discord message (needs larger stack than main task)
-void discord_task(void *param) {
-    char *message = (char *)param;
-    char local_response_buffer[MAX_HTTP_OUTPUT_BUFFER + 1] = {0};
-    char json_data[512];
-    snprintf(json_data, sizeof(json_data), "{\"content\":\"%s\"}", message);
-    
-    esp_http_client_config_t config = {};
-    // Change config.url with your Discord webhook
-    config.url = "";
-    config.event_handler = _http_event_handler;
-    config.user_data = local_response_buffer;
-    config.method = HTTP_METHOD_POST;
-    config.timeout_ms = 5000;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-    
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (client == NULL) {
-        ESP_LOGE(TAG, "Failed to initialize HTTP client");
-        free(message);
-        vTaskDelete(NULL);
-        return;
-    }
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, json_data, strlen(json_data));
-    esp_err_t err = esp_http_client_perform(client);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Discord message sent successfully");
-    } else {
-        ESP_LOGE(TAG, "Failed to send Discord message: %s", esp_err_to_name(err));
-    }
-    esp_http_client_cleanup(client);
-    free(message);
-    vTaskDelete(NULL);
-}
-
-bool sendDiscordMessage(const char* message) {
-    // Allocate message string for task
-    char *msg_copy = (char *)malloc(strlen(message) + 1);
-    if (msg_copy == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for Discord message");
-        return false;
-    }
-    strcpy(msg_copy, message);
-    
-    // Create task with 8KB stack (enough for HTTP client)
-    BaseType_t result = xTaskCreate(discord_task, "discord", 8192, msg_copy, 5, NULL);
-    if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create Discord task");
-        free(msg_copy);
-        return false;
-    }
-    return true;
-}
-
 // Background task to continuously perform face recognition
 void face_recognition_task(void *param)
 {
@@ -1274,19 +1182,21 @@ void face_recognition_task(void *param)
         // Wait for the recognition interval
         vTaskDelay(pdMS_TO_TICKS(RECOGNITION_INTERVAL_MS));
         
-        // Try to acquire camera with short timeout
         if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-            continue;  // Camera busy, skip this cycle
+            continue;
         }
         
         camera_fb_t *fb = esp_camera_fb_get();
-        
-        if (fb) {
-            // Perform face recognition
-            int result = face_recognition_recognize(fb, local_name);
-            
-            // Update global name with mutex protection
-            if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (!fb) {
+            xSemaphoreGive(camera_mutex);
+            continue;
+        }
+
+        int result = face_recognition_recognize(fb, local_name);
+        esp_camera_fb_return(fb);
+        xSemaphoreGive(camera_mutex);
+
+        if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 if (result >= 0) {
                     // Face recognized
                     strcpy(name, local_name);
@@ -1306,15 +1216,9 @@ void face_recognition_task(void *param)
                     }
                     
                     if (should_send) {
-                        // Send Discord notification
-                        char discord_msg[128];
-                        snprintf(discord_msg, sizeof(discord_msg), "🎥 Spotted: %s", name);
-                        sendDiscordMessage(discord_msg);
-                        
-                        // Update tracking variables
                         strcpy(last_sent_name, name);
                         last_recognition_time = current_time;
-                        
+
                         // Set LED to green for recognized face
                         set_neopixel_color(0, 255, 0);
                         vTaskDelay(pdMS_TO_TICKS(500));
@@ -1323,11 +1227,12 @@ void face_recognition_task(void *param)
                         char uart_data[64];
                         float confidence = 95.0; // Độ tin cậy giả định hoặc lấy từ biến nhận diện
             
-                        // Tạo chuỗi: "duong,95.0\n" (có dấu phẩy và xuống dòng)
-                        snprintf(uart_data, sizeof(uart_data), "%s,%.1f\n", name, confidence);
+                        // Tạo chuỗi: "FACE:Duong,95.0\r\n" (prefix FACE: để STM32 phân biệt với AUTH_OK)
+                        snprintf(uart_data, sizeof(uart_data), "FACE:%s,%.1f\r\n", name, confidence);
             
                         // Bắn dữ liệu sang STM32
                         uart_write_bytes(UART_NUM_1, uart_data, strlen(uart_data));
+                        uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
             
                         ESP_LOGI(TAG, "DA GUI SANG STM32: %s", uart_data);
                         // ------------------------------
@@ -1338,15 +1243,64 @@ void face_recognition_task(void *param)
                     strcpy(name, "Unknown");
                 }
                 xSemaphoreGive(name_mutex);
-            }
-            
-            esp_camera_fb_return(fb);
         }
-        
-        xSemaphoreGive(camera_mutex);
-    }
+    }   
 }
 
+static void voice_auth_task(void* arg) {
+    // Cấp phát bộ nhớ thu âm vào PSRAM thay vì RAM nội (giải phóng 32KB)
+    int16_t *audio_buf = (int16_t *)heap_caps_malloc(TOTAL_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (audio_buf == NULL) {
+        ESP_LOGE("MAIN", "Khong du PSRAM de cap phat bo nho thu am!");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Dang ky task voi WDT de co the reset WDT dinh ky
+    if (esp_task_wdt_add(NULL) != ESP_OK) {
+        ESP_LOGW("MAIN", "Failed to add voice_auth_task to Task WDT");
+    }
+
+    while (true) {
+        esp_task_wdt_reset();
+        if (!audio_capture_record(audio_buf, TOTAL_SAMPLES)) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        float score = 0.0f;
+        if (voice_auth_verify(audio_buf, TOTAL_SAMPLES, &score)) {
+            ESP_LOGI("VOICE", "============> DUNG GIONG NOI! Score=%.2f", score);
+
+            char uart_data[32];
+            snprintf(uart_data, sizeof(uart_data), "AUTH_OK\r\n");
+            uart_write_bytes(UART_NUM_1, uart_data, strlen(uart_data));
+            uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+            ESP_LOGI("VOICE", "Sent to STM32: %s", uart_data);
+
+            set_neopixel_color(0, 255, 0);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            set_neopixel_color(0, 0, 255);
+
+            // Chia nho delay 15s thanh cac khoang 100ms de tranh Task WDT timeout (5s)
+            // dong thoi van reset WDT moi lan lap de dam bao an toan
+            for (int i = 0; i < VOICE_AUTH_COOLDOWN_MS / 100; i++) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_task_wdt_reset();
+            }
+        } else {
+            if (score >= 0.0f) {
+                ESP_LOGW("VOICE", "Sai giong hoac chua dat nguong! Score=%.2f", score);
+                char uart_data[32];
+                snprintf(uart_data, sizeof(uart_data), "AUTH_FAIL\r\n");
+                uart_write_bytes(UART_NUM_1, uart_data, strlen(uart_data));
+                uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+}
+// --------------------------------------
 extern "C" void app_main(void)
 {   
     // Initialize NVS
@@ -1372,23 +1326,54 @@ extern "C" void app_main(void)
     }
 
     ESP_LOGI(TAG, "Initializing WiFi...");
-    // --- KHỞI TẠO UART1 ---
+    // --- KHỞI TẠO UART1 (TX-only → STM32) ---
     uart_config_t uart_config = {
-        .baud_rate = 115200, // Tốc độ truyền tin
+        .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+        .source_clk = UART_SCLK_DEFAULT
     };
-    uart_driver_install(UART_NUM_1, 1024, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM_1, &uart_config);
-    // Chân 43 là TX (nối vào PA10 của STM32)
-    uart_set_pin(UART_NUM_1, 43, 44, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    esp_err_t uart_err;
+    uart_err = uart_param_config(UART_NUM_1, &uart_config);
+    if (uart_err != ESP_OK) {
+        ESP_LOGE(TAG, "UART param_config failed: %s", esp_err_to_name(uart_err));
+    }
+
+    // TX  = GPIO 21 (không dùng 17 vì trùng CAM_PIN_D8)
+    // RX  = GPIO_NUM_NC  (TX-only, không dùng RX để tránh xung đột camera)
+    // RTS = GPIO_NUM_NC
+    // CTS = GPIO_NUM_NC
+    uart_err = uart_set_pin(UART_NUM_1,
+                            UART_STM32_TX_PIN,  // TX = 21
+                            GPIO_NUM_NC,        // RX  = -1 (không gán)
+                            GPIO_NUM_NC,        // RTS = -1 (không dùng)
+                            GPIO_NUM_NC);       // CTS = -1 (không dùng)
+    if (uart_err != ESP_OK) {
+        ESP_LOGE(TAG, "UART set_pin failed: %s", esp_err_to_name(uart_err));
+    }
+
+    uart_err = uart_driver_install(UART_NUM_1, 256, 512, 0, NULL, 0);
+    if (uart_err != ESP_OK) {
+        ESP_LOGE(TAG, "UART driver_install failed: %s", esp_err_to_name(uart_err));
+    } else {
+        uart_flush(UART_NUM_1);
+        ESP_LOGI(TAG, "UART1 TX=GPIO%d (STM32, one-way, 115200 8N1)", UART_STM32_TX_PIN);
+    }
     wifi_init_sta();
 
-    // Wait for WiFi connection
-    vTaskDelay(5000 / portTICK_PERIOD_MS);
+    ESP_LOGI(TAG, "Waiting for WiFi connection...");
+    esp_netif_ip_info_t ip_info = {}; // Khởi tạo giá trị 0 tránh rác bộ nhớ
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    int retry = 0;
+    while ((netif == NULL || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) && retry < 40) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        retry++;
+        // Cập nhật netif liên tục để không bị kẹt (Infinite Loop)
+        netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    }
 
     ESP_LOGI(TAG, "Initializing camera...");
     if (init_camera() != ESP_OK) {
@@ -1405,16 +1390,10 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Starting camera server...");
     start_camera_server();
 
-    esp_netif_ip_info_t ip_info;
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+    if (ip_info.ip.addr != 0) {
         ESP_LOGI(TAG, "Setup complete. Access web interface at http://" IPSTR, IP2STR(&ip_info.ip));
-        char discord_msg[256];
-        snprintf(discord_msg, sizeof(discord_msg), "ESP32-S3-CAM started. http://" IPSTR, IP2STR(&ip_info.ip));
-        sendDiscordMessage(discord_msg);
     } else {
         ESP_LOGI(TAG, "Setup complete. Access web interface at http://[YOUR_IP]");
-        sendDiscordMessage("ESP32-S3-CAM started. IP Address: Unknown");
     }
     
     // Set Neopixel to blue to indicate ready
@@ -1423,4 +1402,22 @@ extern "C" void app_main(void)
     // Start background face recognition task
     ESP_LOGI(TAG, "Starting background face recognition task...");
     xTaskCreate(face_recognition_task, "face_recog", 8192, NULL, 5, NULL);
+
+    // --- KHỞI TẠO VOICE AUTH ---
+    ESP_LOGI(TAG, "Initializing Audio...");
+    bool audio_ready = audio_capture_init();
+    
+    if (audio_ready) {
+        voice_auth_ready = voice_auth_init();
+    } else {
+        ESP_LOGW(TAG, "Audio init failed, voice auth task will not start");
+    }
+    
+    if (voice_auth_ready) {
+        ESP_LOGI(TAG, "Voice auth ready. Starting offline voice auth task.");
+        xTaskCreate(voice_auth_task, "voice_auth", 10240, NULL, 5, NULL);
+    } else {
+        ESP_LOGW(TAG, "Voice auth disabled due to initialization error.");
+    }
+    // ---------------------------------------
 }

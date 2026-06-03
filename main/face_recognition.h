@@ -20,7 +20,8 @@ typedef struct {
 } face_id_t;
 
 // Initialize face recognition system
-void face_recognition_init(void);
+// Returns ESP_OK on success, ESP_FAIL or other error code on failure
+esp_err_t face_recognition_init(void);
 
 // Detect and recognize faces in the frame buffer
 // Returns the ID of recognized face, or -1 if no face or unknown face

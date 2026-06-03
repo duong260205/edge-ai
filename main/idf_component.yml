@@ -4,3 +4,5 @@ dependencies:
   espressif/human_face_detect: "^0.3.0"
   espressif/human_face_recognition: "^0.3.0"
   espressif/led_strip: "^3.0.0"
+  espressif/esp-sr: "^2.0.0"            # Bắt buộc cho tính toán MFCC
+  espressif/esp-tflite-micro: "^1.0.0"  # Đặt cứng phiên bản để tránh lỗi cập nhật

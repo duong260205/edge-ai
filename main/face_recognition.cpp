@@ -23,7 +23,6 @@ static HumanFaceRecognizer *face_recognizer = nullptr;
 static face_id_t face_database[MAX_FACE_ID_COUNT];
 static int32_t enrolled_count = 0;
 static const char *db_path = "/spiflash/face.db";
-static const char *nvs_namespace = "face_db";
 static const char *metadata_path = "/spiflash/face_meta.dat";
 
 // Save face metadata to file
@@ -84,7 +83,7 @@ static esp_err_t load_face_metadata(void)
     return ESP_OK;
 }
 
-void face_recognition_init(void)
+esp_err_t face_recognition_init(void)
 {
     ESP_LOGI(TAG, "Initializing face recognition");
     
@@ -105,7 +104,7 @@ void face_recognition_init(void)
         } else {
             ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
         }
-        return;
+        return ret;
     }
     
     size_t total = 0, used = 0;
@@ -116,14 +115,10 @@ void face_recognition_init(void)
         ESP_LOGI(TAG, "SPIFFS partition: total: %d, used: %d", total, used);
     }
     
-    // Create face detector with MSR+MNP models (include .espdl extension)
+    // Sử dụng model được biên dịch sẵn trong Flash (.rodata)
     face_detector = new human_face_detect::MSRMNP(
-        "human_face_detect_msr_s8_v1.espdl",  // MSR model for detection
-        0.3f,  // MSR score threshold
-        0.3f,  // MSR NMS threshold  
-        "human_face_detect_mnp_s8_v1.espdl",  // MNP model for landmarks
-        0.3f,  // MNP score threshold
-        0.3f   // MNP NMS threshold
+        "human_face_detect_msr_s8_v1.espdl", 0.3f, 0.3f,
+        "human_face_detect_mnp_s8_v1.espdl", 0.3f, 0.3f
     );
     
     // Check if face database file exists
@@ -170,6 +165,7 @@ void face_recognition_init(void)
     }
     
     ESP_LOGI(TAG, "Face recognition initialized (%d enrolled faces)", enrolled_count);
+    return ESP_OK;
 }
 
 int face_recognition_recognize(camera_fb_t *fb, char *name_out)
@@ -280,23 +276,29 @@ int face_recognition_enroll(camera_fb_t *fb, const char *name)
     if (ret == ESP_OK) {
         // Get the new ID (last enrolled)
         enrolled_count = face_recognizer->get_num_feats();
-        int id = enrolled_count - 1;
-        
-        // Update our local database
-        if (id < MAX_FACE_ID_COUNT) {
-            face_database[id].id = id;
-            face_database[id].enrolled = true;
-            strncpy(face_database[id].name, name, MAX_NAME_LENGTH - 1);
-            face_database[id].name[MAX_NAME_LENGTH - 1] = '\0';
-            face_database[id].template_count = 1;
-            
-            // Save metadata to persistent storage
-            save_face_metadata();
-            
-            ESP_LOGI(TAG, "Successfully enrolled '%s' with ID %d (Total enrolled: %d)", 
-                     name, id, enrolled_count);
-            return id;
+        // XÓA đoạn: int id = enrolled_count - 1;
+// THAY BẰNG thuật toán quét ID trống:
+    int id = -1;
+    for (int i = 0; i < MAX_FACE_ID_COUNT; i++) {
+        if (!face_database[i].enrolled) {
+            id = i;
+            break;
         }
+    }
+
+    if (id >= 0) {
+        face_database[id].id = id;
+        face_database[id].enrolled = true;
+        strncpy(face_database[id].name, name, MAX_NAME_LENGTH - 1);
+        face_database[id].name[MAX_NAME_LENGTH - 1] = '\0';
+        face_database[id].template_count = 1;
+    
+        enrolled_count++;
+        save_face_metadata();
+    
+        ESP_LOGI(TAG, "Successfully enrolled '%s' with ID %d", name, id);
+        return id;
+    }
     }
     
     ESP_LOGE(TAG, "Enrollment failed");

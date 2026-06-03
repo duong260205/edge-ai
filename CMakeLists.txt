@@ -10,3 +10,6 @@ set(PARTITION_CSV_PATH "${CMAKE_CURRENT_SOURCE_DIR}/partitions.csv")
 # "Trim" the build. Include the minimal set of components, main, and anything it depends on.
 idf_build_set_property(MINIMAL_BUILD ON)
 project(wifi-cam-v3)
+
+# Create SPIFFS image for web assets (HTML/CSS/JS) and flash automatically
+spiffs_create_partition_image(web web_assets FLASH_IN_PROJECT)

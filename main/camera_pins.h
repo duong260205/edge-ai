@@ -24,5 +24,19 @@
 #define CAM_PIN_HREF     7  // Horizontal reference
 #define CAM_PIN_PCLK    13  // Pixel clock
 
+// UART STM32:
+// TX = GPIO 45
+// RX = GPIO 46
+#define UART_STM32_TX_PIN  45
+#define UART_STM32_RX_PIN  46
+
+// I2S Microphone (INMP441 / ICS-43434):
+// BCLK (SCK)  = GPIO 40
+// WS (L/R Sel)  = GPIO 41
+// DATA (SD)   = GPIO 42
+#define I2S_BCLK_PIN   40
+#define I2S_WS_PIN     41
+#define I2S_DATA_PIN   42
+
 #endif // CAMERA_PINS_H
 

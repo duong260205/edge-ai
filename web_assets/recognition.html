@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Live Face Recognition</title>
+<style>
+body { margin: 0; padding: 0; background: #000; font-family: Arial; }
+.container { position: relative; width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+#canvas { max-width: 100%; max-height: 100%; }
+.overlay { position: absolute; bottom: 20px; left: 20px; background: rgba(0,0,0,0.8); color: white; padding: 15px 25px; border-radius: 10px; font-size: 28px; font-weight: bold; min-width: 200px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+.name { color: #4CAF50; }
+.unknown { color: #ff9800; }
+</style>
+</head>
+<body>
+<div class='container'>
+<canvas id='canvas'></canvas>
+<div class='overlay' id='overlay'>
+<span id='name' class='unknown'>Scanning...</span>
+</div>
+</div>
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const nameEl = document.getElementById('name');
+const streamUrl = '/recognition_stream';
+let img = new Image();
+let currentName = 'Scanning...';
+async function fetchStream() {
+  try {
+    const response = await fetch(streamUrl);
+    const reader = response.body.getReader();
+    let buffer = new Uint8Array(0);
+    const boundary = new TextEncoder().encode('--123456789000000000000987654321');
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      const temp = new Uint8Array(buffer.length + value.length);
+      temp.set(buffer);
+      temp.set(value, buffer.length);
+      buffer = temp;
+      let searchStart = 0;
+      while (true) {
+        const boundaryPos = findBoundary(buffer, boundary, searchStart);
+        if (boundaryPos === -1) break;
+        const nextBoundaryPos = findBoundary(buffer, boundary, boundaryPos + boundary.length);
+        if (nextBoundaryPos === -1) break;
+        const chunk = buffer.slice(boundaryPos, nextBoundaryPos);
+        processChunk(chunk);
+        buffer = buffer.slice(nextBoundaryPos);
+        searchStart = 0;
+      }
+    }
+  } catch (e) {
+    console.error('Stream error:', e);
+    setTimeout(fetchStream, 1000);
+  }
+}
+function findBoundary(buffer, boundary, start) {
+  for (let i = start; i <= buffer.length - boundary.length; i++) {
+    let match = true;
+    for (let j = 0; j < boundary.length; j++) {
+      if (buffer[i + j] !== boundary[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return i;
+  }
+  return -1;
+}
+function processChunk(chunk) {
+  const text = new TextDecoder().decode(chunk);
+  const headerEnd = text.indexOf('\r\n\r\n');
+  if (headerEnd === -1) return;
+  const headers = text.substring(0, headerEnd);
+  const nameMatch = headers.match(/X-Face-Name: ([^\r\n]+)/);
+  if (nameMatch) {
+    const name = nameMatch[1].trim();
+    if (name !== currentName) {
+      currentName = name;
+      if (name !== 'Unknown' && name !== '') {
+        nameEl.textContent = name;
+        nameEl.className = 'name';
+      } else {
+        nameEl.textContent = 'No face detected';
+        nameEl.className = 'unknown';
+      }
+    }
+  }
+  const jpegStart = headerEnd + 4;
+  const jpegData = chunk.slice(jpegStart);
+  const blob = new Blob([jpegData], {type: 'image/jpeg'});
+  const url = URL.createObjectURL(blob);
+  img.onload = () => {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.drawImage(img, 0, 0);
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+fetchStream();
+</script>
+</body>
+</html>
