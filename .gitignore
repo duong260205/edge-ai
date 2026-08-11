@@ -6,3 +6,5 @@ build/
 managed_components/
 .DS_Store
 esc50_selected/
+__pycache__/
+nul
