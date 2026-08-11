@@ -15,6 +15,68 @@
 #include "human_face_recognition.hpp"
 
 static const char *TAG = "face_recognition";
+static const char *NVS_NS = "face_auth";
+static const char *NVS_KEY_DETECT = "det_thresh";
+static const char *NVS_KEY_SIMIL = "sim_thresh";
+
+// Runtime thresholds (persisted in NVS)
+static float s_detect_threshold = 0.3f;
+static float s_similarity_threshold = 0.5f;
+
+static float load_float_nvs(const char* ns, const char* key, float default_val)
+{
+    nvs_handle_t nvs;
+    float val = default_val;
+    if (nvs_open(ns, NVS_READONLY, &nvs) == ESP_OK) {
+        uint32_t raw = 0;
+        if (nvs_get_u32(nvs, key, &raw) == ESP_OK) {
+            memcpy(&val, &raw, sizeof(float));
+            if (val < 0.0f || val > 1.0f) val = default_val;
+        }
+        nvs_close(nvs);
+    }
+    return val;
+}
+
+static void save_float_nvs(const char* ns, const char* key, float val)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(ns, NVS_READWRITE, &nvs) == ESP_OK) {
+        uint32_t raw = 0;
+        memcpy(&raw, &val, sizeof(float));
+        nvs_set_u32(nvs, key, raw);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+}
+
+float face_recognition_get_detect_threshold(void)
+{
+    return s_detect_threshold;
+}
+
+void face_recognition_set_detect_threshold(float thresh)
+{
+    if (thresh < 0.0f) thresh = 0.0f;
+    if (thresh > 1.0f) thresh = 1.0f;
+    s_detect_threshold = thresh;
+    save_float_nvs(NVS_NS, NVS_KEY_DETECT, thresh);
+    ESP_LOGI(TAG, "Face detect threshold updated to: %.3f", thresh);
+}
+
+float face_recognition_get_similarity_threshold(void)
+{
+    return s_similarity_threshold;
+}
+
+void face_recognition_set_similarity_threshold(float thresh)
+{
+    if (thresh < 0.0f) thresh = 0.0f;
+    if (thresh > 1.0f) thresh = 1.0f;
+    s_similarity_threshold = thresh;
+    save_float_nvs(NVS_NS, NVS_KEY_SIMIL, thresh);
+    ESP_LOGI(TAG, "Face similarity threshold updated to: %.3f", thresh);
+}
 
 // High-level wrapper classes - much simpler!
 static human_face_detect::MSRMNP *face_detector = nullptr;
@@ -164,11 +226,16 @@ esp_err_t face_recognition_init(void)
         memset(face_database, 0, sizeof(face_database));
     }
     
+    // Load runtime thresholds from NVS
+    s_detect_threshold = load_float_nvs(NVS_NS, NVS_KEY_DETECT, 0.3f);
+    s_similarity_threshold = load_float_nvs(NVS_NS, NVS_KEY_SIMIL, 0.5f);
+    ESP_LOGI(TAG, "Thresholds - detect: %.3f, similarity: %.3f", s_detect_threshold, s_similarity_threshold);
+
     ESP_LOGI(TAG, "Face recognition initialized (%d enrolled faces)", enrolled_count);
     return ESP_OK;
 }
 
-int face_recognition_recognize(camera_fb_t *fb, char *name_out)
+int face_recognition_recognize(camera_fb_t *fb, char *name_out, float *similarity_out)
 {
     if (!fb || !name_out || !face_detector || !face_recognizer) {
         ESP_LOGE(TAG, "Invalid parameters or not initialized");
@@ -194,6 +261,17 @@ int face_recognition_recognize(camera_fb_t *fb, char *name_out)
     if (detect_results.size() > 0) {
         ESP_LOGI(TAG, "Detected %zu face(s)", detect_results.size());
         
+        // Filter detections by score threshold
+        int valid_count = 0;
+        for (auto &d : detect_results) {
+            if (d.score >= s_detect_threshold) valid_count++;
+        }
+        if (valid_count == 0) {
+            ESP_LOGD(TAG, "All detections below score threshold %.3f", s_detect_threshold);
+            heap_caps_free(img.data);
+            return -1;
+        }
+        
         // Recognize faces
         auto results = face_recognizer->recognize(img, detect_results);
         
@@ -201,12 +279,20 @@ int face_recognition_recognize(camera_fb_t *fb, char *name_out)
             // Get the best match
             auto &best = results.front();
             
+            if (best.similarity < s_similarity_threshold) {
+                ESP_LOGD(TAG, "Best match similarity %.3f below threshold %.3f",
+                         best.similarity, s_similarity_threshold);
+                heap_caps_free(img.data);
+                return -1;
+            }
+            
             // Find name from database
             for (int i = 0; i < enrolled_count; i++) {
                 if (face_database[i].id == best.id) {
                     strcpy(name_out, face_database[i].name);
-                    ESP_LOGI(TAG, "Recognized: %s (ID: %d, Similarity: %.3f)", 
-                             name_out, best.id, best.similarity);
+                    if (similarity_out) *similarity_out = best.similarity;
+                    ESP_LOGI(TAG, "Recognized: %s (ID: %d, Similarity: %.3f, threshold: %.3f)", 
+                             name_out, best.id, best.similarity, s_similarity_threshold);
                     heap_caps_free(img.data);
                     return best.id;
                 }

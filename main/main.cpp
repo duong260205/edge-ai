@@ -4,6 +4,7 @@
 #include <algorithm>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -14,12 +15,12 @@
 #include "camera_pins.h"
 #include "driver/gpio.h"
 #include "face_recognition.h"
-#include "led_strip.h"
-#include "driver/uart.h"
 #include "audio_capture.h"
 #include "voice_auth.h"
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
+#include "servo_control.h"
+#include "led_control.h"
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -29,9 +30,30 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #endif
 
-// RGB LED PIN
-#define WS2812_PIN 48
-led_strip_handle_t led_strip;
+// ============================================================
+// STATE MACHINE DEFINITIONS
+// ============================================================
+typedef enum {
+    STATE_STANDBY = 0,          // VoiceID listening, FaceID OFF, LED OFF
+    STATE_VOICE_TRIGGERED,      // VoiceID matched, FaceID activated, LED GREEN solid
+    STATE_FACE_AUTH,            // Waiting for FaceID result
+    STATE_DOOR_OPEN             // FaceID matched, door opening/closing
+} system_state_t;
+
+static system_state_t g_system_state = STATE_STANDBY;
+static SemaphoreHandle_t g_state_mutex = NULL;
+
+// Event group for signaling between tasks
+static EventGroupHandle_t g_auth_events = NULL;
+#define VOICE_AUTH_OK_EVENT     (1 << 0)
+#define VOICE_AUTH_FAIL_EVENT   (1 << 1)
+#define FACE_AUTH_OK_EVENT      (1 << 2)
+#define FACE_AUTH_FAIL_EVENT    (1 << 3)
+
+// FaceID enable/disable flag (gated by state machine)
+static bool g_face_recognition_active = false;
+
+// ============================================================
 
 static const char *TAG = "camera_http_server";
 
@@ -47,10 +69,11 @@ static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %
 httpd_handle_t stream_httpd = NULL;
 static SemaphoreHandle_t camera_mutex = NULL;
 char name[MAX_NAME_LENGTH] = "Unknown";
-static char last_sent_name[MAX_NAME_LENGTH] = "";
-static TickType_t last_recognition_time = 0;
 static SemaphoreHandle_t name_mutex = NULL;
 static bool voice_auth_ready = false;
+
+// Binary semaphore to wake up face_recognition_task immediately when activated
+static SemaphoreHandle_t g_face_trigger_sem = NULL;
 
 static void free_psram(void *ptr)
 {
@@ -59,9 +82,6 @@ static void free_psram(void *ptr)
     }
 }
 
-#define RECOGNITION_INTERVAL_MS 2000  // Check for faces every 2 seconds
-#define RECOGNITION_COOLDOWN_MS 30000 // Wait 30 seconds before sending same name again to UART
-#define VOICE_AUTH_COOLDOWN_MS 15000
 #define MAX_ENROLL_UPLOAD_BYTES (512 * 1024)
 
 // Forward declarations
@@ -1125,64 +1145,36 @@ void start_camera_server(void)
     }
 }
 
-void init_neopixel(void)
-{
-    /* LED strip initialization with the GPIO and pixels number */
-    led_strip_config_t strip_config = {};
-    strip_config.strip_gpio_num = WS2812_PIN;
-    strip_config.max_leds = 1;
-    strip_config.led_model = LED_MODEL_WS2812;
-    strip_config.color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_RGB;
-    strip_config.flags.invert_out = false;
-    
-    /* RMT backend configuration */
-    led_strip_rmt_config_t rmt_config = {};
-    rmt_config.clk_src = RMT_CLK_SRC_DEFAULT;
-    rmt_config.resolution_hz = 10 * 1000 * 1000; // 10MHz
-    rmt_config.flags.with_dma = false;
-    
-    esp_err_t err = led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to initialize NeoPixel LED on GPIO %d: %s (may conflict with JTAG)", 
-                 WS2812_PIN, esp_err_to_name(err));
-        ESP_LOGW(TAG, "NeoPixel LED will be disabled. This is normal if using JTAG debugging.");
-        led_strip = NULL;
-        return;
-    }
-    
-    ESP_LOGI(TAG, "NeoPixel LED initialized on GPIO %d", WS2812_PIN);
-}
-
-void set_neopixel_color(int r, int g, int b)
-{
-    if (led_strip == NULL) {
-        ESP_LOGW(TAG, "LED strip not initialized");
-        return;
-    }
-    
-    esp_err_t err = led_strip_set_pixel(led_strip, 0, r, g, b);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set LED pixel: %s", esp_err_to_name(err));
-        return;
-    }
-    
-    err = led_strip_refresh(led_strip);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to refresh LED: %s", esp_err_to_name(err));
-    }
-}
 
 // Background task to continuously perform face recognition
+// Only runs when g_face_recognition_active is true (gated by state machine)
 void face_recognition_task(void *param)
 {
     ESP_LOGI(TAG, "Face recognition background task started");
     char local_name[MAX_NAME_LENGTH];
     
     while (true) {
-        // Wait for the recognition interval
-        vTaskDelay(pdMS_TO_TICKS(RECOGNITION_INTERVAL_MS));
-        
+        // Check if face recognition is currently active (STATE_VOICE_TRIGGERED or STATE_FACE_AUTH)
+        bool should_run = false;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            should_run = g_face_recognition_active;
+            xSemaphoreGive(g_state_mutex);
+        }
+
+        if (!should_run) {
+            // In STANDBY: don't do face recognition, block on semaphore
+            // Wait indefinitely until the state machine signals activation
+            if (g_face_trigger_sem != NULL) {
+                xSemaphoreTake(g_face_trigger_sem, portMAX_DELAY);
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+            continue;
+        }
+
+        // Face recognition is active — capture and process a frame
         if (xSemaphoreTake(camera_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
         
@@ -1192,63 +1184,131 @@ void face_recognition_task(void *param)
             continue;
         }
 
-        int result = face_recognition_recognize(fb, local_name);
+        int result = face_recognition_recognize(fb, local_name, NULL);
         esp_camera_fb_return(fb);
         xSemaphoreGive(camera_mutex);
 
-        if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                if (result >= 0) {
-                    // Face recognized
-                    strcpy(name, local_name);
-                    
-                    // Check if this is a new recognition or enough time has passed
-                    TickType_t current_time = xTaskGetTickCount();
-                    bool should_send = false;
-                    
-                    if (strcmp(name, last_sent_name) != 0) {
-                        // Different person detected
-                        should_send = true;
-                        ESP_LOGI(TAG, "New person recognized: %s", name);
-                    } else if ((current_time - last_recognition_time) > pdMS_TO_TICKS(RECOGNITION_COOLDOWN_MS)) {
-                        // Same person but cooldown period has passed
-                        should_send = true;
-                        ESP_LOGI(TAG, "Re-sending recognition for: %s (cooldown expired)", name);
-                    }
-                    
-                    if (should_send) {
-                        strcpy(last_sent_name, name);
-                        last_recognition_time = current_time;
-
-                        // Set LED to green for recognized face
-                        set_neopixel_color(0, 255, 0);
-                        vTaskDelay(pdMS_TO_TICKS(500));
-                        set_neopixel_color(0, 0, 255);  // Back to blue
-                        // --- GỬI DỮ LIỆU SANG STM32 ---
-                        char uart_data[64];
-                        float confidence = 95.0; // Độ tin cậy giả định hoặc lấy từ biến nhận diện
-            
-                        // Tạo chuỗi: "FACE:Duong,95.0\r\n" (prefix FACE: để STM32 phân biệt với AUTH_OK)
-                        snprintf(uart_data, sizeof(uart_data), "FACE:%s,%.1f\r\n", name, confidence);
-            
-                        // Bắn dữ liệu sang STM32
-                        uart_write_bytes(UART_NUM_1, uart_data, strlen(uart_data));
-                        uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
-            
-                        ESP_LOGI(TAG, "DA GUI SANG STM32: %s", uart_data);
-                        // ------------------------------
-                        
-                    }
-                } else {
-                    // No face or unknown face
-                    strcpy(name, "Unknown");
-                }
+        if (result >= 0) {
+            ESP_LOGI(TAG, "Face recognized: %s", local_name);
+            if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                strcpy(name, local_name);
                 xSemaphoreGive(name_mutex);
+            }
+            // Signal state machine: FaceID OK
+            if (g_auth_events != NULL) {
+                xEventGroupSetBits(g_auth_events, FACE_AUTH_OK_EVENT);
+            }
+        } else {
+            // No face or unknown face in this frame — just continue
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }   
 }
 
+// State machine controller: runs as a task to manage transitions
+static void state_machine_task(void* arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "State machine task started");
+
+    EventBits_t bits;
+    const TickType_t FACE_AUTH_TIMEOUT = pdMS_TO_TICKS(10000); // 10s timeout for FaceID
+    const TickType_t DOOR_OPEN_DURATION = pdMS_TO_TICKS(5000);  // Door stays open for 5s
+
+    while (true) {
+        // Wait for events from voice auth or face auth tasks
+        bits = xEventGroupWaitBits(
+            g_auth_events,
+            VOICE_AUTH_OK_EVENT | VOICE_AUTH_FAIL_EVENT |
+            FACE_AUTH_OK_EVENT | FACE_AUTH_FAIL_EVENT,
+            pdTRUE,  // Clear bits on exit
+            pdFALSE, // Wait for any bit
+            portMAX_DELAY
+        );
+
+        if (bits & VOICE_AUTH_OK_EVENT) {
+            ESP_LOGI(TAG, "[STATE] VoiceID OK → VOICE_TRIGGERED, activating FaceID");
+            
+            // LED: solid GREEN
+            led_set_color(0, 255, 0);
+
+            // Enable face recognition
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_system_state = STATE_VOICE_TRIGGERED;
+                g_face_recognition_active = true;
+                xSemaphoreGive(g_state_mutex);
+            }
+            // Wake up the face_recognition_task immediately (was blocked on semaphore)
+            if (g_face_trigger_sem != NULL) {
+                xSemaphoreGive(g_face_trigger_sem);
+            }
+
+            // Wait for FaceID result with timeout
+            bits = xEventGroupWaitBits(
+                g_auth_events,
+                FACE_AUTH_OK_EVENT | FACE_AUTH_FAIL_EVENT,
+                pdTRUE, pdFALSE,
+                FACE_AUTH_TIMEOUT
+            );
+
+            // Disable face recognition immediately (save power)
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_face_recognition_active = false;
+                g_system_state = STATE_FACE_AUTH;
+                xSemaphoreGive(g_state_mutex);
+            }
+
+            if (bits & FACE_AUTH_OK_EVENT) {
+                ESP_LOGI(TAG, "[STATE] FaceID OK → DOOR_OPEN");
+
+                // LED: blink GREEN 3 times
+                led_blink_green_success();
+
+                // Open the door
+                if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    g_system_state = STATE_DOOR_OPEN;
+                    xSemaphoreGive(g_state_mutex);
+                }
+                servo_open_door();
+
+                // Wait for door open duration
+                vTaskDelay(DOOR_OPEN_DURATION);
+
+                // Close the door
+                servo_close_door();
+                vTaskDelay(pdMS_TO_TICKS(500)); // Allow servo to settle
+
+                ESP_LOGI(TAG, "[STATE] Door closed → STANDBY");
+            } else {
+                // FaceID timeout or failure
+                ESP_LOGW(TAG, "[STATE] FaceID timeout/fail → STANDBY");
+            }
+
+            // Return to STANDBY
+            led_off();
+            if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                g_system_state = STATE_STANDBY;
+                xSemaphoreGive(g_state_mutex);
+            }
+
+        } else if (bits & VOICE_AUTH_FAIL_EVENT) {
+            ESP_LOGW(TAG, "[STATE] VoiceID FAIL → blink RED, return to STANDBY");
+
+            // LED: blink RED 3 times
+            led_blink_red_fail();
+
+            // Ensure back to STANDBY (LED stays off)
+            led_off();
+
+        // Note: FACE_AUTH_OK_EVENT and FACE_AUTH_FAIL_EVENT are handled
+        // within the VOICE_AUTH_OK branch above (inside the nested xEventGroupWaitBits).
+        // They should not fire here because all event bits are cleared on exit.
+    }
+}
+}
+
 static void voice_auth_task(void* arg) {
-    // Cấp phát bộ nhớ thu âm vào PSRAM thay vì RAM nội (giải phóng 32KB)
+    // Cap phat bo nho thu am vao PSRAM thay vi RAM noi (giai phong 32KB)
     int16_t *audio_buf = (int16_t *)heap_caps_malloc(TOTAL_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (audio_buf == NULL) {
         ESP_LOGE("MAIN", "Khong du PSRAM de cap phat bo nho thu am!");
@@ -1263,6 +1323,23 @@ static void voice_auth_task(void* arg) {
 
     while (true) {
         esp_task_wdt_reset();
+
+        // Only listen for voice in STANDBY state (or if state machine is idle)
+        // This ensures we don't re-trigger while already processing
+        system_state_t current_state;
+        if (xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            current_state = g_system_state;
+            xSemaphoreGive(g_state_mutex);
+        } else {
+            current_state = STATE_STANDBY;
+        }
+
+        if (current_state != STATE_STANDBY) {
+            // If we're in the middle of face auth or door open, skip recording
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         if (!audio_capture_record(audio_buf, TOTAL_SAMPLES)) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
@@ -1270,31 +1347,24 @@ static void voice_auth_task(void* arg) {
 
         float score = 0.0f;
         if (voice_auth_verify(audio_buf, TOTAL_SAMPLES, &score)) {
-            ESP_LOGI("VOICE", "============> DUNG GIONG NOI! Score=%.2f", score);
+            ESP_LOGI("VOICE", "============> VOICE MATCHED! Score=%.2f", score);
 
-            char uart_data[32];
-            snprintf(uart_data, sizeof(uart_data), "AUTH_OK\r\n");
-            uart_write_bytes(UART_NUM_1, uart_data, strlen(uart_data));
-            uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
-            ESP_LOGI("VOICE", "Sent to STM32: %s", uart_data);
-
-            set_neopixel_color(0, 255, 0);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            set_neopixel_color(0, 0, 255);
-
-            // Chia nho delay 15s thanh cac khoang 100ms de tranh Task WDT timeout (5s)
-            // dong thoi van reset WDT moi lan lap de dam bao an toan
-            for (int i = 0; i < VOICE_AUTH_COOLDOWN_MS / 100; i++) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                esp_task_wdt_reset();
+            // Signal state machine: Voice OK
+            if (g_auth_events != NULL) {
+                xEventGroupSetBits(g_auth_events, VOICE_AUTH_OK_EVENT);
             }
+
+            // Wait a short period before next recording (avoid re-trigger)
+            // The state machine handles the rest, so just wait
+            vTaskDelay(pdMS_TO_TICKS(1000));
         } else {
             if (score >= 0.0f) {
-                ESP_LOGW("VOICE", "Sai giong hoac chua dat nguong! Score=%.2f", score);
-                char uart_data[32];
-                snprintf(uart_data, sizeof(uart_data), "AUTH_FAIL\r\n");
-                uart_write_bytes(UART_NUM_1, uart_data, strlen(uart_data));
-                uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
+                ESP_LOGW("VOICE", "Voice NOT matched! Score=%.2f", score);
+
+                // Signal state machine: Voice FAIL (blink RED)
+                if (g_auth_events != NULL) {
+                    xEventGroupSetBits(g_auth_events, VOICE_AUTH_FAIL_EVENT);
+                }
             }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
@@ -1325,53 +1395,40 @@ extern "C" void app_main(void)
         return;
     }
 
+    // Create state machine mutex
+    g_state_mutex = xSemaphoreCreateMutex();
+    if (g_state_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create state mutex");
+        return;
+    }
+
+    // Create event group for auth signaling
+    g_auth_events = xEventGroupCreate();
+    if (g_auth_events == NULL) {
+        ESP_LOGE(TAG, "Failed to create event group");
+        return;
+    }
+
+    // Create binary semaphore for face recognition wakeup
+    g_face_trigger_sem = xSemaphoreCreateBinary();
+    if (g_face_trigger_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create face trigger semaphore");
+        return;
+    }
+
+    // --- NO UART/STM32: removed completely ---
+    // Servo and LED are now controlled directly by ESP32-S3
+
     ESP_LOGI(TAG, "Initializing WiFi...");
-    // --- KHỞI TẠO UART1 (TX-only → STM32) ---
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT
-    };
-
-    esp_err_t uart_err;
-    uart_err = uart_param_config(UART_NUM_1, &uart_config);
-    if (uart_err != ESP_OK) {
-        ESP_LOGE(TAG, "UART param_config failed: %s", esp_err_to_name(uart_err));
-    }
-
-    // TX  = GPIO 21 (không dùng 17 vì trùng CAM_PIN_D8)
-    // RX  = GPIO_NUM_NC  (TX-only, không dùng RX để tránh xung đột camera)
-    // RTS = GPIO_NUM_NC
-    // CTS = GPIO_NUM_NC
-    uart_err = uart_set_pin(UART_NUM_1,
-                            UART_STM32_TX_PIN,  // TX = 21
-                            GPIO_NUM_NC,        // RX  = -1 (không gán)
-                            GPIO_NUM_NC,        // RTS = -1 (không dùng)
-                            GPIO_NUM_NC);       // CTS = -1 (không dùng)
-    if (uart_err != ESP_OK) {
-        ESP_LOGE(TAG, "UART set_pin failed: %s", esp_err_to_name(uart_err));
-    }
-
-    uart_err = uart_driver_install(UART_NUM_1, 256, 512, 0, NULL, 0);
-    if (uart_err != ESP_OK) {
-        ESP_LOGE(TAG, "UART driver_install failed: %s", esp_err_to_name(uart_err));
-    } else {
-        uart_flush(UART_NUM_1);
-        ESP_LOGI(TAG, "UART1 TX=GPIO%d (STM32, one-way, 115200 8N1)", UART_STM32_TX_PIN);
-    }
     wifi_init_sta();
 
     ESP_LOGI(TAG, "Waiting for WiFi connection...");
-    esp_netif_ip_info_t ip_info = {}; // Khởi tạo giá trị 0 tránh rác bộ nhớ
+    esp_netif_ip_info_t ip_info = {};
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     int retry = 0;
     while ((netif == NULL || esp_netif_get_ip_info(netif, &ip_info) != ESP_OK || ip_info.ip.addr == 0) && retry < 40) {
         vTaskDelay(pdMS_TO_TICKS(500));
         retry++;
-        // Cập nhật netif liên tục để không bị kẹt (Infinite Loop)
         netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     }
 
@@ -1384,40 +1441,23 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "Initializing face recognition...");
     face_recognition_init();
 
-    ESP_LOGI(TAG, "Initializing NeoPixel LED...");
-    init_neopixel();
+    ESP_LOGI(TAG, "Initializing WS2812 LED...");
+    led_init();
 
-    ESP_LOGI(TAG, "Starting camera server...");
+    ESP_LOGI(TAG, "Initializing Servo (GPIO %d)...", SERVO_PIN);
+    servo_init();
+    // Ensure servo
+    servo_close_door(); // Start with door closed
+
+    // Start the background tasks
+    xTaskCreate(face_recognition_task, "face_rec_task", 8192, NULL, 5, NULL);
+    xTaskCreate(state_machine_task, "state_machine", 4096, NULL, 6, NULL);
+    
+    // Start voice auth task only if audio is ready
+    if (audio_capture_init() && voice_auth_init()) {
+        voice_auth_ready = true;
+        xTaskCreate(voice_auth_task, "voice_auth_task", 10240, NULL, 5, NULL);
+    }
+
     start_camera_server();
-
-    if (ip_info.ip.addr != 0) {
-        ESP_LOGI(TAG, "Setup complete. Access web interface at http://" IPSTR, IP2STR(&ip_info.ip));
-    } else {
-        ESP_LOGI(TAG, "Setup complete. Access web interface at http://[YOUR_IP]");
-    }
-    
-    // Set Neopixel to blue to indicate ready
-    set_neopixel_color(0, 0, 255);
-    
-    // Start background face recognition task
-    ESP_LOGI(TAG, "Starting background face recognition task...");
-    xTaskCreate(face_recognition_task, "face_recog", 8192, NULL, 5, NULL);
-
-    // --- KHỞI TẠO VOICE AUTH ---
-    ESP_LOGI(TAG, "Initializing Audio...");
-    bool audio_ready = audio_capture_init();
-    
-    if (audio_ready) {
-        voice_auth_ready = voice_auth_init();
-    } else {
-        ESP_LOGW(TAG, "Audio init failed, voice auth task will not start");
-    }
-    
-    if (voice_auth_ready) {
-        ESP_LOGI(TAG, "Voice auth ready. Starting offline voice auth task.");
-        xTaskCreate(voice_auth_task, "voice_auth", 10240, NULL, 5, NULL);
-    } else {
-        ESP_LOGW(TAG, "Voice auth disabled due to initialization error.");
-    }
-    // ---------------------------------------
 }

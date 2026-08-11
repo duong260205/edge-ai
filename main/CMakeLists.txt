@@ -4,8 +4,11 @@ idf_component_register(
         "face_recognition.cpp"
         "audio_capture.cpp" 
         "voice_auth.cpp"
-        "model_data.cc"
-    INCLUDE_DIRS "."
+        "model_data.cc"    # Thêm file chứa trọng số model AI
+        "http_handlers.cpp"
+        "led_control.cpp"
+        "servo_control.cpp"
+    INCLUDE_DIRS "." 
     REQUIRES 
         esp_psram 
         esp_wifi 

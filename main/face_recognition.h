@@ -25,7 +25,8 @@ esp_err_t face_recognition_init(void);
 
 // Detect and recognize faces in the frame buffer
 // Returns the ID of recognized face, or -1 if no face or unknown face
-int face_recognition_recognize(camera_fb_t *fb, char *name_out);
+// If similarity_out is not NULL, the similarity score (0..1) is written there
+int face_recognition_recognize(camera_fb_t *fb, char *name_out, float *similarity_out);
 
 // Enroll a new face with the given name
 // Returns face ID on success, -1 on failure
@@ -45,6 +46,14 @@ int face_recognition_get_enrolled_count(void);
 
 // Get face info by ID
 esp_err_t face_recognition_get_info(int id, face_id_t *info);
+
+// Runtime face detection threshold (score filter, default 0.3)
+float face_recognition_get_detect_threshold(void);
+void face_recognition_set_detect_threshold(float thresh);
+
+// Runtime face recognition similarity threshold (default 0.5)
+float face_recognition_get_similarity_threshold(void);
+void face_recognition_set_similarity_threshold(float thresh);
 
 #ifdef __cplusplus
 }

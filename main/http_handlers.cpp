@@ -695,7 +695,7 @@ static esp_err_t voice_enroll_handler(httpd_req_t *req)
         return send_json(req, "{\"status\":\"busy\",\"message\":\"Voice subsystem is busy\"}");
     }
 
-    size_t record_samples = AUDIO_SAMPLE_RATE;
+    size_t record_samples = SAMPLE_RATE;
     int16_t *audio_buf = (int16_t *)heap_caps_malloc(record_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (audio_buf == nullptr) {
         give_voice_http_mutex();
@@ -744,7 +744,7 @@ static esp_err_t voice_verify_handler(httpd_req_t *req)
         return send_json(req, "{\"status\":\"busy\",\"message\":\"Voice subsystem is busy\"}");
     }
 
-    size_t num_samples = AUDIO_SAMPLE_RATE;
+    size_t num_samples = SAMPLE_RATE;
     int16_t *audio_buf = (int16_t *)heap_caps_malloc(num_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (audio_buf == nullptr) {
         give_voice_http_mutex();
@@ -818,7 +818,7 @@ static esp_err_t voice_settings_get_handler(httpd_req_t *req)
     char json[512];
     snprintf(json, sizeof(json),
              "{\"threshold\":%.2f,\"vad_sensitivity\":%.2f,\"sample_rate\":%d}",
-             AUTH_THRESHOLD, 0.75f, AUDIO_SAMPLE_RATE);
+             AUTH_THRESHOLD, 0.75f, SAMPLE_RATE);
     return send_json(req, json);
 }
 
@@ -835,7 +835,7 @@ static esp_err_t voice_settings_post_handler(httpd_req_t *req)
              "\"threshold\":%.2f,"
              "\"vad_sensitivity\":%.2f,"
              "\"sample_rate\":%d}}",
-             AUTH_THRESHOLD, 0.75f, AUDIO_SAMPLE_RATE);
+             AUTH_THRESHOLD, 0.75f, SAMPLE_RATE);
     return send_json(req, json);
 }
 

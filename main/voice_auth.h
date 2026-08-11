@@ -3,7 +3,7 @@
 #include <cstdint>
 
 #define EMBEDDING_SIZE  128   // phụ thuộc model bạn dùng
-#define AUTH_THRESHOLD  0.65f
+#define AUTH_THRESHOLD  0.7f
 #define VOICE_ENROLL_SAMPLE_COUNT 5
 
 bool voice_auth_init();

@@ -69,8 +69,8 @@ bool audio_capture_record(int16_t* buffer, size_t num_samples) {
         size_t valid_samples = bytes_read / sizeof(int32_t);
         for (size_t i = 0; i < valid_samples; i++) {
             // INMP441 trả về dữ liệu 24-bit left-justified trong 32-bit slot.
-            // Dịch phải 16 bit để lấy 16-bit MSB (không khuếch đại, tránh clipping)
-            int32_t sample = chunk_buf[i] >> 16; 
+            // Dịch phải 14 bit để lấy 16-bit MSB và khuếch đại (gain x4)
+            int32_t sample = chunk_buf[i] >> 14; 
             
             // Chống tràn số học (clipping) để không bị nổ tiếng
             if (sample > 32767) sample = 32767;
