@@ -6,6 +6,8 @@
 #define FRAME_SIZE      512
 #define RECORD_SECONDS  1
 #define TOTAL_SAMPLES   (SAMPLE_RATE * RECORD_SECONDS)
+#define VERIFY_SAMPLE_COUNT 3
+#define VERIFY_TOTAL_SAMPLES (SAMPLE_RATE * VERIFY_SAMPLE_COUNT)
 
 // I2S pins - chỉnh theo board của bạn
 #define I2S_BCLK_PIN    40

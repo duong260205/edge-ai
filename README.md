@@ -215,8 +215,14 @@ http://<ESP32-IP>/
 
 ### Đăng ký giọng nói (Enroll Voice)
 1. Mở `http://<ip>/voice`
-2. Nhập tên → bấm **Start Enrollment** (nói **5 lần** liên tiếp theo hướng dẫn)
-3. Xem danh sách **Enrolled Speakers**
+2. Nhập tên → bấm **Record 5 enrollment samples**, sau đó nói liên tục khoảng **5 giây**
+3. Profile được trung bình từ 5 cửa sổ 1 giây và lưu bền vững trong NVS
+4. Xem danh sách **Enrolled Speakers**; có thể xóa profile rồi đăng ký lại
+
+Khi xác thực, thiết bị ghi khoảng 3 giây và trung bình các cửa sổ có tiếng nói.
+Điểm cuối kết hợp điểm CNN `target/noise` với độ tương đồng profile đã đăng ký,
+giúp giảm ảnh hưởng của nhiễu và một đoạn âm thanh bất thường. Firmware hiện lưu
+một profile người nói trên thiết bị; muốn đổi người, hãy xóa profile cũ trước.
 
 ---
 
@@ -236,8 +242,8 @@ http://<ESP32-IP>/
 ### Voice
 | Method | Endpoint | Mô tả |
 |--------|----------|-------|
-| POST | `/voice/enroll?name=X` | Đăng ký giọng nói (thu 5 mẫu) |
-| POST | `/voice/verify?name=X` | Kiểm tra giọng nói (name tùy chọn) |
+| POST | `/voice/enroll?name=X` | Thu 5 giây, tạo profile trung bình và lưu NVS |
+| POST | `/voice/verify?name=X` | Thu 3 giây, xác thực qua nhiều cửa sổ (name tùy chọn) |
 | GET | `/voice/speakers` | Danh sách speakers |
 | DELETE | `/voice/speakers?name=X` | Xóa speaker |
 | GET/POST | `/voice/settings` | Đọc/chỉnh ngưỡng & VAD sensitivity |

@@ -17,6 +17,7 @@
 #include "face_recognition.h"
 #include "audio_capture.h"
 #include "voice_auth.h"
+#include "http_handlers.h"
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
 #include "servo_control.h"
@@ -61,15 +62,70 @@ static const char *TAG = "camera_http_server";
 #define WIFI_SSID "P404"
 #define WIFI_PASS "12344321"
 
+// PIN bao mat cho cac endpoint nhay cam (enroll/delete/reset/voice)
+// GUI len bang header "X-Admin-Pin: <pin>" hoac query param "?pin=<pin>"
+// DOI PIN NAY TRUOC KHI SU DUNG THUC TE!
+#define ADMIN_PIN "246810"
+
+// Escape chuoi de nhung an toan vao JSON (chan XSS khi name chua ky tu dac biet)
+static void json_escape(const char *src, char *dst, size_t dst_size)
+{
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 7 < dst_size; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+            dst[j++] = (char)c;
+        } else if (c == '<' || c == '>') {
+            j += snprintf(dst + j, 7, "\\u%04X", c);
+        } else if (c < 0x20) {
+            j += snprintf(dst + j, 7, "\\u%04X", c);
+        } else {
+            dst[j++] = (char)c;
+        }
+    }
+    dst[j] = '\0';
+}
+
+// Kiem tra PIN tu header "X-Admin-Pin" hoac query param "pin"
+static bool check_admin_pin(httpd_req_t *req)
+{
+    char pin[32] = {0};
+    size_t hdr_len = httpd_req_get_hdr_value_len(req, "X-Admin-Pin");
+    if (hdr_len > 0 && hdr_len < sizeof(pin)) {
+        httpd_req_get_hdr_value_str(req, "X-Admin-Pin", pin, sizeof(pin));
+        if (strcmp(pin, ADMIN_PIN) == 0) {
+            return true;
+        }
+    }
+    pin[0] = '\0';
+    char query[128];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "pin", pin, sizeof(pin)) == ESP_OK) {
+        if (strcmp(pin, ADMIN_PIN) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Tra loi 403 neu PIN sai
+static esp_err_t send_pin_required(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_status(req, "403 Forbidden");
+    return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Invalid or missing PIN (X-Admin-Pin header or ?pin= query param)\"}");
+}
+
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
 httpd_handle_t stream_httpd = NULL;
-static SemaphoreHandle_t camera_mutex = NULL;
+SemaphoreHandle_t camera_mutex = NULL;   // extern trong http_handlers.h
 char name[MAX_NAME_LENGTH] = "Unknown";
-static SemaphoreHandle_t name_mutex = NULL;
+SemaphoreHandle_t name_mutex = NULL;     // extern trong http_handlers.h
 static bool voice_auth_ready = false;
 
 // Binary semaphore to wake up face_recognition_task immediately when activated
@@ -93,6 +149,10 @@ static const char* index_html = "<!DOCTYPE html>"
 "<head>"
 "<meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<title>Face Recognition Camera</title>"
+"<script>"
+"const ADMIN_PIN = '246810';" // dong bo voi ADMIN_PIN trong main.cpp
+"function adminHeaders() { return { 'X-Admin-Pin': ADMIN_PIN }; }"
+"</script>"
 "<style>"
 "body { font-family: Arial; margin: 20px; background: #f0f0f0; }"
 ".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }"
@@ -185,6 +245,7 @@ static const char* index_html = "<!DOCTYPE html>"
 "  formData.append('name', name);"
 "  fetch('/enroll', {"
 "    method: 'POST',"
+"    headers: adminHeaders(),"
 "    body: formData"
 "  })"
 "    .then(r => {"
@@ -209,7 +270,7 @@ static const char* index_html = "<!DOCTYPE html>"
 "}"
 "function deleteAllFaces() {"
 "  if (!confirm('Delete all enrolled faces?')) return;"
-"  fetch('/delete_all')"
+"  fetch('/delete_all', { headers: adminHeaders() })"
 "    .then(r => r.json())"
 "    .then(d => {"
 "      showStatus('All faces deleted', true);"
@@ -220,7 +281,7 @@ static const char* index_html = "<!DOCTYPE html>"
 "function resetDatabase() {"
 "  if (!confirm('Reset database and metadata? This will remove all face data and fix corruption issues. This action cannot be undone.')) return;"
 "  showStatus('Resetting database...', true);"
-"  fetch('/reset_database')"
+"  fetch('/reset_database', { headers: adminHeaders() })"
 "    .then(r => r.json())"
 "    .then(d => {"
 "      if (d.success) {"
@@ -451,7 +512,12 @@ static esp_err_t enroll_handler(httpd_req_t *req)
     char name[MAX_NAME_LENGTH] = {0};
     uint8_t *image_buf = NULL;
     size_t image_len = 0;
-    
+
+    // SECURITY: endpoint nhay cam - bat buoc PIN
+    if (!check_admin_pin(req)) {
+        return send_pin_required(req);
+    }
+
     // Add CORS headers
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
     
@@ -506,14 +572,23 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         }
         
         ESP_LOGI(TAG, "Received %d bytes", received);
-        
+
+        // BUG-1 fix: guard tranh underflow size_t khi body qua ngan
+        if (received < 24) {
+            ESP_LOGE(TAG, "Body too short (%zu bytes) for multipart parse", received);
+            free_psram(image_buf);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Body too short\"}");
+            return ESP_OK;
+        }
+
         // Parse multipart form data
         // Format: boundary + image part + boundary + name part + boundary
         // The image comes first (name="image"), then the name field (name="name")
         
         // Find JPEG image data (starts with FF D8 FF)
         uint8_t *jpeg_start = NULL;
-        for (size_t i = 0; i < received - 3; i++) {
+        for (size_t i = 0; i + 3 < received; i++) {
             if (image_buf[i] == 0xFF && image_buf[i+1] == 0xD8 && image_buf[i+2] == 0xFF) {
                 jpeg_start = &image_buf[i];
                 ESP_LOGI(TAG, "Found JPEG start at offset %d", i);
@@ -556,7 +631,7 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         char *name_field = NULL;
         
         // First, try to find "name=\"name\"" pattern
-        for (size_t i = (jpeg_end - image_buf); i < received - 20; i++) {
+        for (size_t i = (jpeg_end - image_buf); i + 20 < received; i++) {
             if (strncmp((char*)&image_buf[i], "name=\"name\"", 11) == 0) {
                 name_field = (char*)&image_buf[i];
                 ESP_LOGI(TAG, "Found name field at offset %d", i);
@@ -617,9 +692,11 @@ static esp_err_t enroll_handler(httpd_req_t *req)
         
         free_psram(image_buf);
         
-        char json[128];
+        char json[160];
+        char esc_name[MAX_NAME_LENGTH * 6 + 1];
+        json_escape(name, esc_name, sizeof(esc_name));
         if (id >= 0) {
-            snprintf(json, sizeof(json), "{\"success\":true,\"id\":%d,\"name\":\"%s\"}", id, name);
+            snprintf(json, sizeof(json), "{\"success\":true,\"id\":%d,\"name\":\"%s\"}", id, esc_name);
             ESP_LOGI(TAG, "Enrollment successful, ID: %d", id);
         } else {
             snprintf(json, sizeof(json), "{\"success\":false,\"message\":\"Face detection failed\"}");
@@ -658,11 +735,13 @@ static esp_err_t enroll_handler(httpd_req_t *req)
             int id = face_recognition_enroll(fb, name);
             esp_camera_fb_return(fb);
             xSemaphoreGive(camera_mutex);
-            
-            char json[128];
+
+            char json[160];
+            char esc_name[MAX_NAME_LENGTH * 6 + 1];
+            json_escape(name, esc_name, sizeof(esc_name));
             if (id >= 0) {
                 ESP_LOGI(TAG, "Enrollment successful, ID: %d", id);
-                snprintf(json, sizeof(json), "{\"success\":true,\"id\":%d,\"name\":\"%s\"}", id, name);
+                snprintf(json, sizeof(json), "{\"success\":true,\"id\":%d,\"name\":\"%s\"}", id, esc_name);
             } else {
                 ESP_LOGE(TAG, "Enrollment failed");
                 snprintf(json, sizeof(json), "{\"success\":false,\"message\":\"No face detected or enrollment failed\"}");
@@ -717,6 +796,9 @@ static esp_err_t faces_handler(httpd_req_t *req)
 static esp_err_t delete_all_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Delete all handler called");
+    if (!check_admin_pin(req)) {
+        return send_pin_required(req);
+    }
     
     esp_err_t err = face_recognition_delete_all();
     
@@ -729,9 +811,12 @@ static esp_err_t delete_all_handler(httpd_req_t *req)
 }
 
 // Reset database handler - removes database and metadata files
-static esp_err_t reset_database_handler(httpd_req_t *req)
-{
+static esp_err_t reset_database_handler(httpd_req_t *req) {
+
     ESP_LOGI(TAG, "Reset database handler called");
+    if (!check_admin_pin(req)) {
+        return send_pin_required(req);
+    }
     
     esp_err_t err = face_recognition_reset_database();
     
@@ -1001,15 +1086,18 @@ static esp_err_t recognized_name_handler(httpd_req_t *req)
     
     // Get current name with mutex protection
     if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        strcpy(current_name, name);
+        strncpy(current_name, name, MAX_NAME_LENGTH - 1);
+        current_name[MAX_NAME_LENGTH - 1] = '\0';
         xSemaphoreGive(name_mutex);
     } else {
         strcpy(current_name, "Unknown");
     }
     
     httpd_resp_set_type(req, "application/json");
-    char json[128];
-    snprintf(json, sizeof(json), "{\"name\":\"%s\"}", current_name);
+    char json[MAX_NAME_LENGTH * 6 + 32];
+    char esc_name[MAX_NAME_LENGTH * 6 + 1];
+    json_escape(current_name, esc_name, sizeof(esc_name));
+    snprintf(json, sizeof(json), "{\"name\":\"%s\"}", esc_name);
     return httpd_resp_sendstr(req, json);
 }
 
@@ -1127,6 +1215,9 @@ void start_camera_server(void)
         ESP_LOGI(TAG, "Registered: /capture");
         httpd_register_uri_handler(stream_httpd, &recognized_name_uri);
         ESP_LOGI(TAG, "Registered: /recognized_name");
+
+        // BUG-4 fix: dang ky cac endpoint /voice/* va /status (truoc day khong duoc goi)
+        register_voice_httpd_handlers(stream_httpd);
         
         esp_err_t rec_reg = httpd_register_uri_handler(stream_httpd, &recognition_stream_uri);
         ESP_LOGI(TAG, "Registered: /recognition (result: %d)", rec_reg);
@@ -1199,7 +1290,12 @@ void face_recognition_task(void *param)
                 xEventGroupSetBits(g_auth_events, FACE_AUTH_OK_EVENT);
             }
         } else {
-            // No face or unknown face in this frame — just continue
+            // BUG-6 fix: khong nhan dien duoc -> reset ve 'Unknown'
+            // de giao dien web/API khong hien ten cu mai mai
+            if (xSemaphoreTake(name_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                strcpy(name, "Unknown");
+                xSemaphoreGive(name_mutex);
+            }
             vTaskDelay(pdMS_TO_TICKS(100));
         }
     }   
@@ -1309,7 +1405,7 @@ static void state_machine_task(void* arg)
 
 static void voice_auth_task(void* arg) {
     // Cap phat bo nho thu am vao PSRAM thay vi RAM noi (giai phong 32KB)
-    int16_t *audio_buf = (int16_t *)heap_caps_malloc(TOTAL_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    int16_t *audio_buf = (int16_t *)heap_caps_malloc(VERIFY_TOTAL_SAMPLES * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (audio_buf == NULL) {
         ESP_LOGE("MAIN", "Khong du PSRAM de cap phat bo nho thu am!");
         vTaskDelete(NULL);
@@ -1340,13 +1436,13 @@ static void voice_auth_task(void* arg) {
             continue;
         }
 
-        if (!audio_capture_record(audio_buf, TOTAL_SAMPLES)) {
+        if (!audio_capture_record(audio_buf, VERIFY_TOTAL_SAMPLES)) {
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
         float score = 0.0f;
-        if (voice_auth_verify(audio_buf, TOTAL_SAMPLES, &score)) {
+        if (voice_auth_verify_multi(audio_buf, VERIFY_SAMPLE_COUNT, SAMPLE_RATE, &score)) {
             ESP_LOGI("VOICE", "============> VOICE MATCHED! Score=%.2f", score);
 
             // Signal state machine: Voice OK
@@ -1431,18 +1527,22 @@ extern "C" void app_main(void)
         retry++;
         netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     }
-
-    ESP_LOGI(TAG, "Initializing camera...");
+    if (ip_info.ip.addr != 0) {
+        sys_status.wifi_connected = true;
+    }    ESP_LOGI(TAG, "Initializing camera...");
     if (init_camera() != ESP_OK) {
         ESP_LOGE(TAG, "Camera init failed");
         return;
     }
+    sys_status.camera_ok = true;
 
     ESP_LOGI(TAG, "Initializing face recognition...");
     face_recognition_init();
+    sys_status.face_recognition_ok = true;
 
     ESP_LOGI(TAG, "Initializing WS2812 LED...");
     led_init();
+    sys_status.neopixel_ok = true;
 
     ESP_LOGI(TAG, "Initializing Servo (GPIO %d)...", SERVO_PIN);
     servo_init();
@@ -1452,10 +1552,12 @@ extern "C" void app_main(void)
     // Start the background tasks
     xTaskCreate(face_recognition_task, "face_rec_task", 8192, NULL, 5, NULL);
     xTaskCreate(state_machine_task, "state_machine", 4096, NULL, 6, NULL);
-    
+
     // Start voice auth task only if audio is ready
     if (audio_capture_init() && voice_auth_init()) {
         voice_auth_ready = true;
+        sys_status.audio_ready = true;
+        sys_status.voice_auth_ready = true;
         xTaskCreate(voice_auth_task, "voice_auth_task", 10240, NULL, 5, NULL);
     }
 

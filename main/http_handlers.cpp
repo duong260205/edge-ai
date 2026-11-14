@@ -365,7 +365,7 @@ static const char* voice_html = "<!DOCTYPE html>"
 "      <input type=\"text\" id=\"enroll-name\" placeholder=\"e.g. john\" maxlength=\"31\">"
 "      <button class=\"btn btn-primary\" id=\"btn-enroll\" onclick=\"enrollSpeaker()\">"
 "        <span id=\"enroll-icon\">[mic]</span>"
-"        <span id=\"enroll-text\">Start Enrollment (5 samples)</span>"
+"        <span id=\"enroll-text\">Record 5 enrollment samples</span>"
 "      </button>"
 "      <div class=\"progress-container\" id=\"enroll-progress\">"
 "        <div class=\"progress-bar-bg\">"
@@ -467,9 +467,9 @@ static const char* voice_html = "<!DOCTYPE html>"
 "  const name = document.getElementById('enroll-name').value.trim();"
 "  if (!name) { showStatus('enroll-status', 'Please enter a speaker name', 'error'); return; }"
 "  isEnrolling = true;"
-"  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', true, 'Enrolling...');"
+"  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', true, 'Recording 5 samples (~5s)...');"
 "  hideProgress('enroll-progress');"
-"  setProgress('enroll-progress', 'enroll-progress-fill', 'enroll-progress-text', 30, '[mic] Speak now...');"
+"  setProgress('enroll-progress', 'enroll-progress-fill', 'enroll-progress-text', 30, '[mic] Speak continuously for 5 seconds...');"
 "  document.getElementById('enroll-status').className = 'status';"
 "  try {"
 "    const r = await fetch('/voice/enroll?name=' + encodeURIComponent(name), { method: 'POST' });"
@@ -489,7 +489,7 @@ static const char* voice_html = "<!DOCTYPE html>"
 "    hideProgress('enroll-progress');"
 "  }"
 "  isEnrolling = false;"
-"  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', false, 'Start Enrollment (5 samples)');"
+"  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', false, 'Record 5 enrollment samples');"
 "}"
 "async function verifySpeaker() {"
 "  if (isVerifying) return;"
@@ -675,8 +675,7 @@ static esp_err_t voice_page_handler(httpd_req_t *req)
 
 // ---------------------------------------------------------------------------
 // POST /voice/enroll?name=john
-// Triggers a 5-sample enrollment loop.
-// NOTE: The underlying voice_auth_enroll() is currently a stub (no-op).
+// Records five consecutive one-second windows and stores their averaged profile.
 // ---------------------------------------------------------------------------
 static esp_err_t voice_enroll_handler(httpd_req_t *req)
 {
@@ -695,7 +694,7 @@ static esp_err_t voice_enroll_handler(httpd_req_t *req)
         return send_json(req, "{\"status\":\"busy\",\"message\":\"Voice subsystem is busy\"}");
     }
 
-    size_t record_samples = SAMPLE_RATE;
+    size_t record_samples = SAMPLE_RATE * VOICE_ENROLL_SAMPLE_COUNT;
     int16_t *audio_buf = (int16_t *)heap_caps_malloc(record_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (audio_buf == nullptr) {
         give_voice_http_mutex();
@@ -709,15 +708,25 @@ static esp_err_t voice_enroll_handler(httpd_req_t *req)
         return send_json(req, "{\"status\":\"error\",\"message\":\"Audio recording failed\"}");
     }
 
-    bool ok = voice_auth_enroll(speaker_name, audio_buf, (int)record_samples);
+    bool ok = voice_auth_enroll_multi(speaker_name, audio_buf,
+                                      VOICE_ENROLL_SAMPLE_COUNT, SAMPLE_RATE);
     heap_caps_free(audio_buf);
     give_voice_http_mutex();
 
     char json[MAX_JSON_RESPONSE];
     if (ok) {
+        char esc[MAX_SPEAKER_NAME * 6 + 1];
+        size_t j = 0;
+        for (size_t i = 0; speaker_name[i] != '\0' && j + 7 < sizeof(esc); i++) {
+            unsigned char c = (unsigned char)speaker_name[i];
+            if (c == '"' || c == '\\') { esc[j++] = '\\'; esc[j++] = (char)c; }
+            else if (c < 0x20 || c == '<' || c == '>') { j += snprintf(esc + j, 7, "\\u%04X", c); }
+            else { esc[j++] = (char)c; }
+        }
+        esc[j] = '\0';
         snprintf(json, sizeof(json),
-                 "{\"status\":\"success\",\"message\":\"Speaker '%s' enrolled successfully (stub)\"}",
-                 speaker_name);
+                 "{\"status\":\"success\",\"message\":\"Speaker '%s' enrolled successfully from %d samples\"}",
+                 esc, VOICE_ENROLL_SAMPLE_COUNT);
     } else {
         snprintf(json, sizeof(json),
                  "{\"status\":\"error\",\"message\":\"Enrollment failed\"}");
@@ -739,12 +748,19 @@ static esp_err_t voice_verify_handler(httpd_req_t *req)
 
     char speaker_name[MAX_SPEAKER_NAME];
     bool has_name = get_query_param(req, "name", speaker_name, sizeof(speaker_name)) && strlen(speaker_name) > 0;
+    if (has_name) {
+        char enrolled_name[MAX_SPEAKER_NAME];
+        if (!voice_auth_get_profile_name(enrolled_name, sizeof(enrolled_name)) ||
+            strcmp(enrolled_name, speaker_name) != 0) {
+            return send_json(req, "{\"status\":\"error\",\"message\":\"Speaker is not enrolled\"}");
+        }
+    }
 
     if (!take_voice_http_mutex(pdMS_TO_TICKS(100))) {
         return send_json(req, "{\"status\":\"busy\",\"message\":\"Voice subsystem is busy\"}");
     }
 
-    size_t num_samples = SAMPLE_RATE;
+    size_t num_samples = VERIFY_TOTAL_SAMPLES;
     int16_t *audio_buf = (int16_t *)heap_caps_malloc(num_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     if (audio_buf == nullptr) {
         give_voice_http_mutex();
@@ -771,8 +787,7 @@ static esp_err_t voice_verify_handler(httpd_req_t *req)
     float confidence = 0.0f;
     bool matched = false;
     if (voice_detected) {
-        (void)has_name;
-        matched = voice_auth_verify(audio_buf, (int)num_samples, &confidence);
+        matched = voice_auth_verify_multi(audio_buf, VERIFY_SAMPLE_COUNT, SAMPLE_RATE, &confidence);
     }
 
     char json[MAX_JSON_RESPONSE];
@@ -797,7 +812,28 @@ static esp_err_t voice_verify_handler(httpd_req_t *req)
 static esp_err_t voice_speakers_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG_VOICE_HTTP, "Voice speakers handler called");
-    return send_json(req, "{\"count\":0,\"speakers\":[]}");
+    char name[MAX_SPEAKER_NAME];
+    if (!voice_auth_get_profile_name(name, sizeof(name))) {
+        return send_json(req, "{\"count\":0,\"speakers\":[]}");
+    }
+    char escaped[MAX_SPEAKER_NAME * 6 + 1];
+    size_t j = 0;
+    for (size_t i = 0; name[i] != '\0' && j + 7 < sizeof(escaped); ++i) {
+        unsigned char c = (unsigned char)name[i];
+        if (c == '"' || c == '\\') {
+            escaped[j++] = '\\';
+            escaped[j++] = (char)c;
+        } else if (c < 0x20 || c == '<' || c == '>') {
+            j += snprintf(escaped + j, 7, "\\u%04X", c);
+        } else {
+            escaped[j++] = (char)c;
+        }
+    }
+    escaped[j] = '\0';
+    char json[256];
+    snprintf(json, sizeof(json), "{\"count\":1,\"speakers\":[{\"name\":\"%s\",\"samples\":%d}]}",
+             escaped, VOICE_ENROLL_SAMPLE_COUNT);
+    return send_json(req, json);
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +842,11 @@ static esp_err_t voice_speakers_handler(httpd_req_t *req)
 static esp_err_t voice_delete_speaker_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG_VOICE_HTTP, "Voice delete speaker handler called");
-    return send_json(req, "{\"status\":\"error\",\"message\":\"Deletion not supported in current firmware\"}");
+    char name[MAX_SPEAKER_NAME];
+    if (!get_query_param(req, "name", name, sizeof(name)) || !voice_auth_delete_profile(name)) {
+        return send_json(req, "{\"status\":\"error\",\"message\":\"Speaker not found\"}");
+    }
+    return send_json(req, "{\"status\":\"success\",\"message\":\"Speaker deleted\"}");
 }
 
 // ---------------------------------------------------------------------------

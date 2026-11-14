@@ -1,4 +1,4 @@
-build/
+﻿build/
 .git/
 .devcontainer/
 .clangd
@@ -7,4 +7,16 @@ managed_components/
 .DS_Store
 esc50_selected/
 __pycache__/
+*.pyc
 nul
+
+# Python venvs & wheel binaries
+tools/venv-pdf2zh/
+tools/PDFMathTranslate/
+*.whl
+
+# Cache & intermediate doc build artifacts
+docs/_deck_fig/
+docs/_deckpng/
+docs/_ei_api/
+docs/_eq_cache/

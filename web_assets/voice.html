@@ -339,7 +339,7 @@ input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
       <input type="text" id="enroll-name" placeholder="e.g. john" maxlength="31">
       <button class="btn btn-primary" id="btn-enroll" onclick="enrollSpeaker()">
         <span id="enroll-icon">🎤</span>
-        <span id="enroll-text">Start Enrollment (5 samples)</span>
+        <span id="enroll-text">Record 5 enrollment samples</span>
       </button>
       <div class="progress-container" id="enroll-progress">
         <div class="progress-bar-bg">
@@ -467,9 +467,9 @@ async function enrollSpeaker() {
   if (!name) { showStatus('enroll-status', 'Please enter a speaker name', 'error'); return; }
 
   isEnrolling = true;
-  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', true, 'Enrolling (speak 5 times, ~15s)...');
+  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', true, 'Recording 5 samples (~5s)...');
   hideProgress('enroll-progress');
-  setProgress('enroll-progress', 'enroll-progress-fill', 'enroll-progress-text', 30, '🎤 Speak now — 5 samples needed...');
+  setProgress('enroll-progress', 'enroll-progress-fill', 'enroll-progress-text', 30, '🎤 Speak continuously for 5 seconds...');
   document.getElementById('enroll-status').className = 'status';
 
   try {
@@ -493,7 +493,7 @@ async function enrollSpeaker() {
   }
 
   isEnrolling = false;
-  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', false, 'Start Enrollment (5 samples)');
+  setButtonLoading('btn-enroll', 'enroll-icon', 'enroll-text', false, 'Record 5 enrollment samples');
 }
 
 // ============================================================================
